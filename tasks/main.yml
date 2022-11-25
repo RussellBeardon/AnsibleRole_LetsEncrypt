@@ -1,0 +1,222 @@
+---
+  - debug: var=certificate_binding
+  - debug: var=path
+
+  - set_fact:
+      location_key: "{{ path }}/account/account.key"
+      location_private_key: "{{ path }}/{{ certificate_binding.friendly_name }}/key/{{ certificate_binding.friendly_name }}.pem"
+      location_csr: "{{ path }}/{{ certificate_binding.friendly_name }}/csr/{{ certificate_binding.friendly_name }}.csr"
+      location_cert: "{{ path }}/{{ certificate_binding.friendly_name }}/cert/{{ certificate_binding.friendly_name }}"
+      location_pfx: "{{ path }}/{{ certificate_binding.friendly_name }}/cert/{{ certificate_binding.friendly_name }}.pfx"
+
+    # create directories
+  - name: "create letsencrypt path dir"
+    run_once: true
+    delegate_to: 127.0.0.1
+    become: yes
+    file:
+      path: "{{ path }}"
+      state: directory
+      owner: root
+      group: ansibleUsers
+      mode: u=rwx,g=rwx,o=x
+
+  # create directories
+  - name: "create acme account dir"
+    run_once: true
+    delegate_to: 127.0.0.1
+    become: yes
+    file:
+      path: "{{ path }}/{{ item }}"
+      state: directory
+      owner: root
+      group: ansibleUsers
+      mode: u=rwx,g=rwx,o=x
+      recurse: yes
+    with_items:
+      - account
+
+  # create directories
+  - name: create certificate dirs
+    run_once: true
+    delegate_to: 127.0.0.1
+    become: yes
+    file:
+      path: "{{ path }}/{{ certificate_binding.friendly_name }}/{{ item }}"
+      state: directory
+      owner: root
+      group: ansibleUsers
+      mode: u=rwx,g=rwx,o=x
+      recurse: yes
+    with_items:
+      - cert
+      - csr
+      - key
+
+  # check if acme private key exists 
+  - stat:
+      path: "{{ path }}/account/account.key"
+    delegate_to: 127.0.0.1
+    run_once: true
+    register: result
+
+  - name: Generate an OpenSSL private key with the default values if one doesn't exist (4096 bits, RSA)
+    delegate_to: 127.0.0.1
+    run_once: true
+    become: yes
+    openssl_privatekey:
+      path: "{{ path }}/account/account.key"
+    when: result.stat.exists == false
+
+  # create a letsEcnrypt acme account
+  - name: Make sure account exists and has given contacts. We agree to TOS.
+    delegate_to: 127.0.0.1
+    run_once: true
+    become: yes
+    acme_account:
+      acme_directory: "{{ acme_directory }}"
+      account_key_src: "{{ path }}/account/account.key"
+      acme_version: 2
+      state: present
+      terms_agreed: yes
+      contact:
+      - "mailto:{{ email }}"
+
+  # private key used to creat a CSR
+  - name: Generate an OpenSSL private key with the default values (4096 bits, RSA)
+    run_once: true
+    delegate_to: 127.0.0.1
+    become: yes
+    openssl_privatekey:
+      path: "{{ location_private_key }}"
+      owner: root
+      group: ansibleUsers
+      mode: '771'
+
+  ###############################################################################################
+  ###### two CSR request available depending on whether the subject_alt_name has been defined
+
+  - name: generate a CSR for certificate request
+    delegate_to: 127.0.0.1
+    run_once: true
+    become: yes
+    openssl_csr:
+      path: "{{ location_csr }}"
+      privatekey_path: "{{ location_private_key }}"
+      common_name: "{{ certificate_binding.hostname }}"
+      country_name: "{{ country_name }}"
+      organization_name: "{{ organization_name }}"
+      email_address: "{{ email }}"
+      subject_alt_name: "{{ subject_alt_name|default(omit) }}"
+
+  ########################################################################
+      
+
+  # apply for certificate
+  - name: apply for letsencrypt certificate
+    delegate_to: 127.0.0.1
+    run_once: true
+    become: yes
+    acme_certificate:
+      account_email: "{{ email }}"
+      account_key_src: "{{ location_key }}"
+      acme_directory: "{{ acme_directory }}"
+      acme_version: 2
+      challenge: dns-01
+      csr: "{{ location_csr }}"
+      fullchain_dest: "{{ location_cert }}-fullchain.crt"
+      remaining_days: "{{ remaining_days }}"
+      terms_agreed: "{{ terms_agreed }}"
+    register: acme_challenge
+
+  - debug: var=acme_challenge
+    run_once: true
+    delegate_to: 127.0.0.1
+
+  - set_fact:
+      dns_challenge: "{{ q('dict', acme_challenge.challenge_data_dns) }}"
+    run_once: true
+    when: acme_challenge is changed and not ansible_check_mode
+
+  - debug: var=dns_challenge
+    run_once: true
+    delegate_to: 127.0.0.1
+    when: dns_challenge is defined
+
+    # cloudflare dns update
+  - name: Create Cloudflare TXT record for validation
+    delegate_to: 127.0.0.1
+    run_once: true
+    cloudflare_dns:
+      record: "{{ item.key }}"
+      type: TXT
+      value: "{{ item.value | regex_replace('^.{2}','') | regex_replace('.{2}$','') }}" # replace first and last 2 characters to get rid of quotes and brackets e.g ["PCUuxnaRtlA2CFNW4WT3pEL9Kqn8PqxG8_xYQoOB6EY"]
+      account_email: "{{ cloudflare_email }}"
+      account_api_token: "{{ cloudflare_api_token }}"
+      zone: "{{ certificate_binding.cloudflare_zone }}"
+      solo: true
+      state: present
+    #with_dict: "{{ lookup('dict', acme_challenge.challenge_data_dns, wantlist=True) | default({}) }}"
+    loop: "{{ dns_challenge }}"
+    when: dns_challenge is defined
+
+  - name: sleep for 30 seconds to give DNS time to update
+    run_once: true
+    delegate_to: 127.0.0.1
+    wait_for:
+      timeout: 30
+    when: acme_challenge is changed
+
+    # verify cert
+  - name: Let the challenge be validated and retrieve the cert and intermediate certificate
+    run_once: true
+    delegate_to: 127.0.0.1
+    become: yes
+    acme_certificate:
+      account_key_src: "{{ location_key }}"
+      account_email: "{{ email }}"
+      src: "{{ location_csr }}"
+      cert: "{{ location_cert }}.crt"
+      fullchain: "{{ location_cert  }}-fullchain.crt"
+      chain: "{{ location_cert  }}-intermediate.crt"
+      challenge: dns-01
+      acme_directory: "{{ acme_directory }}"
+      acme_version: 2
+      remaining_days: "{{ remaining_days }}"
+      data: "{{ acme_challenge }}"
+    when: acme_challenge is changed
+
+    # cloudflare removal
+  - name: Remove Cloudflare TXT record for validation
+    run_once: true
+    delegate_to: 127.0.0.1
+    cloudflare_dns:
+      zone: "{{ certificate_binding.cloudflare_zone }}"
+      #domain: "{{ certificate_binding.hostname }}"
+      record: "{{ item.key }}"
+      type: TXT
+      value: "{{ item.value }}"
+      account_email: "{{ cloudflare_email }}"
+      account_api_token: "{{ cloudflare_api_token }}"
+      state: absent
+    loop: "{{ dns_challenge }}"
+    when: dns_challenge is defined
+
+    # create a pkcs12 file
+  - name: Generate PKCS#12 file
+    run_once: true
+    delegate_to: 127.0.0.1
+    become: yes
+    openssl_pkcs12:
+      action: export
+      path: "{{ location_cert }}.pfx"
+      mode: '771'
+      group: ansibleUsers
+      friendly_name: "{{ certificate_binding.friendly_name }}"
+      privatekey_path: "{{ location_private_key }}"
+      certificate_path: "{{ location_cert  }}.crt"
+      #other_certificates: "{{ location_cert  }}-intermediate.crt"
+      other_certificates: "{{ location_cert  }}-fullchain.crt"
+      passphrase: "{{ pkcs_passphrase|default(omit) }}"
+      state: present
+    when: acme_challenge is changed

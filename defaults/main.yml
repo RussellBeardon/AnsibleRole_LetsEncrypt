@@ -1,0 +1,15 @@
+---
+  email: "<email>"
+  acme_directory: https://acme-staging-v02.api.letsencrypt.org/directory
+  acme_version: 2
+  remaining_days: 61
+  terms_agreed: yes
+  path: /etc/ansible/letsencrypt
+  cloudflare_token: "{{ cloudflare_api_token }}"
+  cloudflare_email: "{{ cloudflare_email }}"
+  # certificate data
+  country_name: UK
+  organization_name: <org>
+  
+
+      
